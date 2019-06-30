@@ -24,7 +24,7 @@
 
 void* teavm_gc_heapAddress = NULL;
 
-void** teavm_stackTop;
+TeaVM_StackFrame* teavm_stackTop;
 
 void* teavm_gc_gcStorageAddress = NULL;
 int32_t teavm_gc_gcStorageSize = INT32_C(0);
@@ -459,7 +459,7 @@ char* teavm_char16ToMb(char16_t* javaChars, int32_t length) {
 }
 
 TeaVM_Array* teavm_parseArguments(int argc, char** argv) {
-    TeaVM_Array* array = teavm_allocateStringArray(max(argc - 1, 0));
+    TeaVM_Array* array = teavm_allocateStringArray(argc > 1 ? argc - 1 : 0);
     TeaVM_String** arrayData = TEAVM_ARRAY_DATA(array, TeaVM_String*);
     for (int i = 1; i < argc; ++i) {
         arrayData[i - 1] = teavm_cToString(argv[i]);
@@ -543,7 +543,7 @@ TeaVM_StringList* teavm_appendString(TeaVM_StringList* list, char16_t* data, int
 }
 
 #ifndef TEAVM_WINDOWS_LOG
-void teavm_logchar(char16_t c) {
+void teavm_logchar(int32_t c) {
     putwchar(c);
 }
 #else

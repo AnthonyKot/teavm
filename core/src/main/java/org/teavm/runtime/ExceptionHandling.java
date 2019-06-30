@@ -25,8 +25,19 @@ public final class ExceptionHandling {
     private ExceptionHandling() {
     }
 
+    @Unmanaged
     public static native CallSite findCallSiteById(int id, Address frame);
 
+    @Unmanaged
+    public static native boolean isJumpSupported();
+
+    @Unmanaged
+    public static native void jumpToFrame(Address frame, int id);
+
+    @Unmanaged
+    public static native void abort();
+
+    @Unmanaged
     public static void printStack() {
         Address stackFrame = ShadowStack.getStackTop();
         while (stackFrame != null) {
@@ -72,6 +83,7 @@ public final class ExceptionHandling {
         RuntimeClass exceptionClass = RuntimeClass.getClass(exceptionPtr);
 
         Address stackFrame = ShadowStack.getStackTop();
+        int handlerId = 0;
         stackLoop: while (stackFrame != null) {
             int callSiteId = ShadowStack.getCallSiteId(stackFrame);
             CallSite callSite = findCallSiteById(callSiteId, stackFrame);
@@ -79,6 +91,7 @@ public final class ExceptionHandling {
 
             while (handler != null) {
                 if (handler.exceptionClass == null || handler.exceptionClass.isSupertypeOf.apply(exceptionClass)) {
+                    handlerId = handler.id;
                     ShadowStack.setExceptionHandlerId(stackFrame, handler.id);
                     break stackLoop;
                 }
@@ -87,6 +100,13 @@ public final class ExceptionHandling {
 
             ShadowStack.setExceptionHandlerId(stackFrame, callSiteId - 1);
             stackFrame = ShadowStack.getNextStackFrame(stackFrame);
+        }
+
+        if (stackFrame == null) {
+            printStack();
+            abort();
+        } else if (isJumpSupported()) {
+            jumpToFrame(stackFrame, handlerId);
         }
     }
 

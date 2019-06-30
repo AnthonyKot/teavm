@@ -15,6 +15,7 @@
  */
 package org.teavm.backend.c.generate;
 
+import static org.teavm.model.lowlevel.ExceptionHandlingShadowStackContributor.isManagedMethodCall;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.DoubleBuffer;
@@ -83,6 +84,9 @@ import org.teavm.model.MethodReference;
 import org.teavm.model.TextLocation;
 import org.teavm.model.ValueType;
 import org.teavm.model.classes.VirtualTable;
+import org.teavm.model.lowlevel.CallSiteDescriptor;
+import org.teavm.model.lowlevel.CallSiteLocation;
+import org.teavm.model.lowlevel.ExceptionHandlerDescriptor;
 import org.teavm.runtime.Allocator;
 import org.teavm.runtime.ExceptionHandling;
 import org.teavm.runtime.Fiber;
@@ -107,6 +111,8 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
             Object.class, void.class);
     private static final MethodReference MONITOR_EXIT_SYNC = new MethodReference(Object.class, "monitorExitSync",
             Object.class, void.class);
+    private static final MethodReference CATCH_EXCEPTION = new MethodReference(ExceptionHandling.class,
+            "catchException", Throwable.class);
 
     private static final Map<String, String> BUFFER_TYPES = new HashMap<>();
 
@@ -120,6 +126,9 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     private boolean end;
     private boolean async;
     private final Deque<LocationStackEntry> locationStack = new ArrayDeque<>();
+    private List<CallSiteDescriptor> callSites;
+    private List<ExceptionHandlerDescriptor> handlers = new ArrayList<>();
+    private boolean managed;
 
     static {
         BUFFER_TYPES.put(ByteBuffer.class.getName(), "int8_t");
@@ -131,11 +140,13 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
         BUFFER_TYPES.put(DoubleBuffer.class.getName(), "double");
     }
 
-    public CodeGenerationVisitor(GenerationContext context, CodeWriter writer, IncludeManager includes) {
+    public CodeGenerationVisitor(GenerationContext context, CodeWriter writer, IncludeManager includes,
+            List<CallSiteDescriptor> callSites) {
         this.context = context;
         this.writer = writer;
         this.names = context.getNames();
         this.includes = includes;
+        this.callSites = callSites;
     }
 
     public void setAsync(boolean async) {
@@ -148,6 +159,7 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
 
     public void setCallingMethod(MethodReference callingMethod) {
         this.callingMethod = callingMethod;
+        this.managed = context.getCharacteristics().isManaged(callingMethod);
     }
 
     @Override
@@ -405,6 +417,10 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
         }
     }
 
+    private boolean needsCallSiteId() {
+        return context.isLongjmp() && managed;
+    }
+
     @Override
     public void visit(InvocationExpr expr) {
         ClassReader cls = context.getClassSource().get(expr.getMethod().getClassName());
@@ -416,15 +432,30 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
             }
         }
 
+        boolean needParenthesis = false;
+
         Intrinsic intrinsic = context.getIntrinsic(expr.getMethod());
         if (intrinsic != null) {
             pushLocation(expr.getLocation());
+            if (needsCallSiteId() && isManagedMethodCall(context.getCharacteristics(), expr.getMethod())) {
+                needParenthesis = true;
+                withCallSite();
+            }
             intrinsic.apply(intrinsicContext, expr);
             popLocation(expr.getLocation());
+            if (needParenthesis) {
+                writer.print(")");
+            }
             return;
         }
 
         pushLocation(expr.getLocation());
+
+        if (needsCallSiteId() && context.getCharacteristics().isManaged(expr.getMethod())) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         switch (expr.getType()) {
             case CONSTRUCTOR:
                 generateCallToConstructor(expr.getMethod(), expr.getArguments());
@@ -441,7 +472,26 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
             }
         }
 
+        if (needParenthesis) {
+            writer.print(")");
+        }
+
         popLocation(expr.getLocation());
+    }
+
+    private void withCallSite() {
+        LocationStackEntry locationEntry = locationStack.peek();
+        TextLocation location = locationEntry != null ? locationEntry.location : null;
+        CallSiteLocation callSiteLocation = new CallSiteLocation(
+                location != null ? location.getFileName() : null,
+                callingMethod.getClassName(),
+                callingMethod.getName(),
+                location != null ? location.getLine() : 0);
+        CallSiteDescriptor callSite = new CallSiteDescriptor(callSites.size(), callSiteLocation);
+        callSite.getHandlers().addAll(new ArrayList<>(handlers));
+        callSites.add(callSite);
+
+        writer.print("TEAVM_WITH_CALL_SITE_ID(").print(String.valueOf(callSite.getId())).print(", ");
     }
 
     private void generateCallToConstructor(MethodReference reference, List<? extends Expr> arguments) {
@@ -751,9 +801,17 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     @Override
     public void visit(NewExpr expr) {
         pushLocation(expr.getLocation());
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
         includes.includeClass(expr.getConstructedClass());
         includes.includeClass(ALLOC_METHOD.getClassName());
         allocObject(expr.getConstructedClass());
+        if (needParenthesis) {
+            writer.print(")");
+        }
         popLocation(expr.getLocation());
     }
 
@@ -766,6 +824,13 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     @Override
     public void visit(NewArrayExpr expr) {
         pushLocation(expr.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         ValueType type = ValueType.arrayOf(expr.getType());
         writer.print(names.forMethod(ALLOC_ARRAY_METHOD)).print("(&")
                 .print(names.forClassInstance(type)).print(", ");
@@ -773,11 +838,24 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
         includes.includeType(type);
         expr.getLength().acceptVisitor(this);
         writer.print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+
         popLocation(expr.getLocation());
     }
 
     @Override
     public void visit(NewMultiArrayExpr expr) {
+        pushLocation(expr.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         writer.print(names.forMethod(ALLOC_MULTI_ARRAY_METHOD)).print("(&")
                 .print(names.forClassInstance(expr.getType())).print(", ");
         includes.includeClass(ALLOC_ARRAY_METHOD.getClassName());
@@ -791,6 +869,12 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
         }
 
         writer.print("}, ").print(String.valueOf(expr.getDimensions().size())).print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+
+        popLocation(expr.getLocation());
     }
 
     @Override
@@ -813,11 +897,24 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
                 return;
             }
         }
+
         pushLocation(expr.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         writer.print("teavm_checkcast(");
         expr.getValue().acceptVisitor(this);
         includes.includeType(expr.getTarget());
         writer.print(", ").print(names.forSupertypeFunction(expr.getTarget())).print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+
         popLocation(expr.getLocation());
     }
 
@@ -1036,23 +1133,83 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     @Override
     public void visit(ThrowStatement statement) {
         pushLocation(statement.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         includes.includeClass(THROW_EXCEPTION_METHOD.getClassName());
         writer.print(names.forMethod(THROW_EXCEPTION_METHOD)).print("(");
         statement.getException().acceptVisitor(this);
-        writer.println(");");
+        writer.print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+        writer.println(";");
+
         popLocation(statement.getLocation());
     }
 
     @Override
     public void visit(InitClassStatement statement) {
         pushLocation(statement.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         includes.includeClass(statement.getClassName());
-        writer.println(names.forClassInitializer(statement.getClassName()) + "();");
+        writer.print(names.forClassInitializer(statement.getClassName()) + "()");
+
+        if (needParenthesis) {
+            writer.println(")");
+        }
+        writer.println(";");
+
         popLocation(statement.getLocation());
     }
 
     @Override
     public void visit(TryCatchStatement statement) {
+        List<TryCatchStatement> tryCatchStatements = new ArrayList<>();
+        while (statement.getProtectedBody() instanceof TryCatchStatement) {
+            tryCatchStatements.add(statement);
+            statement = (TryCatchStatement) statement.getProtectedBody();
+        }
+        tryCatchStatements.add(statement);
+
+        int firstId = handlers.size();
+        for (int i = 0; i < tryCatchStatements.size(); ++i) {
+            TryCatchStatement tryCatch = tryCatchStatements.get(i);
+            handlers.add(new ExceptionHandlerDescriptor(firstId + i + 1, tryCatch.getExceptionType()));
+        }
+
+        writer.println("TEAVM_TRY").indent();
+        visitMany(statement.getProtectedBody());
+        writer.outdent().println("TEAVM_CATCH").indent();
+
+        for (int i = tryCatchStatements.size() - 1; i >= 0; --i) {
+            TryCatchStatement tryCatch = tryCatchStatements.get(i);
+            writer.println("case " + (i + 1 + firstId) + ": {").indent();
+
+            if (tryCatch.getExceptionVariable() != null) {
+                writer.print(getVariableName(tryCatch.getExceptionVariable())).print(" = ");
+                writer.print(names.forMethod(CATCH_EXCEPTION)).println("();");
+            }
+            visitMany(tryCatch.getHandler());
+
+            writer.println("break;");
+            writer.outdent().println("}");
+        }
+
+        handlers.subList(firstId, handlers.size()).clear();
+
+        writer.outdent().println("TEAVM_END_TRY");
     }
 
     @Override
@@ -1062,20 +1219,46 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     @Override
     public void visit(MonitorEnterStatement statement) {
         pushLocation(statement.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         includes.includeClass("java.lang.Object");
         writer.print(names.forMethod(async ? MONITOR_ENTER : MONITOR_ENTER_SYNC)).print("(");
         statement.getObjectRef().acceptVisitor(this);
-        writer.println(");");
+        writer.print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+        writer.println(";");
+
         popLocation(statement.getLocation());
     }
 
     @Override
     public void visit(MonitorExitStatement statement) {
         pushLocation(statement.getLocation());
+
+        boolean needParenthesis = false;
+        if (needsCallSiteId()) {
+            needParenthesis = true;
+            withCallSite();
+        }
+
         includes.includeClass("java.lang.Object");
         writer.print(names.forMethod(async ? MONITOR_EXIT : MONITOR_EXIT_SYNC)).print("(");
         statement.getObjectRef().acceptVisitor(this);
-        writer.println(");");
+        writer.print(")");
+
+        if (needParenthesis) {
+            writer.print(")");
+        }
+        writer.println(";");
+
         popLocation(statement.getLocation());
     }
 
